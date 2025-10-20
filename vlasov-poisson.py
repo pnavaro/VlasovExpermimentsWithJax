@@ -68,43 +68,67 @@ class VlasovPoissonSolver:
         return E
 
     @partial(jit, static_argnums=(0,))
-    def cubic_spline_periodic(self, x_new, x_old, y_old):
-        """Cubic spline interpolation with periodic boundary conditions"""
-        # Extend array for periodicity
-        y_ext = jnp.concatenate([y_old[-1:], y_old, y_old[:1]])
-        x_ext = jnp.concatenate([x_old[-1:] - self.x_max, x_old, x_old[:1] + self.x_max])
+    def cubic_spline_interp_periodic(self, x_new, x_old, y_old):
+        """
+        Cubic spline interpolation with periodic boundary conditions
+        Solved using FFT via circulant matrix approach
+        """
+        n = len(x_old)
+        h = x_old[1] - x_old[0]  # Assume uniform grid
 
-        # Find indices for interpolation
-        idx = jnp.searchsorted(x_old, x_new % self.x_max)
-        idx = jnp.clip(idx, 0, len(x_old) - 1)
+        # Step 1: Solve for second derivatives using FFT
+        # For periodic cubic splines: M @ d2y = rhs
+        # where M is circulant with first row [4, 1, 0, ..., 0, 1]
 
-        # Get local neighborhood for cubic interpolation (4 points)
-        i = idx
-        x0, x1 = x_ext[i], x_ext[i + 1]
-        x_1, x2 = x_ext[i - 1 + 1], x_ext[i + 2]  # adjusted indexing
-        y0, y1 = y_ext[i], y_ext[i + 1]
-        y_1, y2 = y_ext[i - 1 + 1], y_ext[i + 2]
+        # Build right-hand side: 6 * second finite differences
+        y_ext = jnp.concatenate([y_old, y_old[:1]])  # Periodic extension
+        rhs = 6.0 / h**2 * (jnp.roll(y_old, -1) - 2 * y_old + jnp.roll(y_old, 1))
 
-        # Normalize position in interval
-        t = (x_new - x0) / (x1 - x0)
+        # Solve using FFT (circulant matrix eigenvalues)
+        # Eigenvalues of circulant matrix [4, 1, 0, ..., 0, 1]
+        k = jnp.arange(n)
+        lambda_k = 4 + 2 * jnp.cos(2 * jnp.pi * k / n)
 
-        # Catmull-Rom spline coefficients
-        a = -0.5 * y_1 + 1.5 * y0 - 1.5 * y1 + 0.5 * y2
-        b = y_1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2
-        c = -0.5 * y_1 + 0.5 * y1
-        d = y0
+        # Solve in Fourier space
+        rhs_hat = jnp.fft.fft(rhs)
+        d2y_hat = rhs_hat / lambda_k
+        d2y = jnp.real(jnp.fft.ifft(d2y_hat))
 
-        return a * t**3 + b * t**2 + c * t + d
+        # Step 2: Evaluate spline at new points
+        # Wrap x_new to [0, x_max)
+        x_wrapped = x_new % self.x_max
+
+        # Find interval for each point
+        idx = jnp.floor(x_wrapped / h).astype(int) % n
+
+        # Local coordinate in interval [0, h]
+        xi = x_wrapped - idx * h
+
+        # Get values and second derivatives at interval endpoints
+        y_i = y_old[idx]
+        y_ip1 = jnp.roll(y_old, -1)[idx]
+        d2y_i = d2y[idx]
+        d2y_ip1 = jnp.roll(d2y, -1)[idx]
+
+        # Cubic spline formula
+        A = (h - xi) / h
+        B = xi / h
+        C = (A**3 - A) * h**2 / 6
+        D = (B**3 - B) * h**2 / 6
+
+        result = A * y_i + B * y_ip1 + C * d2y_i + D * d2y_ip1
+
+        return result
 
     @partial(jit, static_argnums=(0,))
     def advect_x(self, f, dt):
-        """Advect in x-direction (free streaming) with cubic spline interpolation"""
+        """Advect in x-direction (free streaming) with cubic spline FFT interpolation"""
         # For each velocity, compute departure points
         x_dep = (self.x[:, None] - self.v[None, :] * dt) % self.x_max
 
         # Cubic spline interpolation for each velocity slice
         def interp_cubic(x_new, f_slice):
-            return self.cubic_spline_periodic(x_new, self.x, f_slice)
+            return self.cubic_spline_interp_periodic(x_new, self.x, f_slice)
 
         # Use vmap to vectorize over velocity dimension
         f_new = jax.vmap(lambda j: interp_cubic(x_dep[:, j], f[:, j]), out_axes=1)(jnp.arange(self.nv))
@@ -112,48 +136,27 @@ class VlasovPoissonSolver:
         return f_new
 
     @partial(jit, static_argnums=(0,))
-    def cubic_spline_bounded(self, v_new, v_old, y_old):
-        """Cubic spline interpolation with clamped boundaries"""
-        # Find indices for interpolation
-        idx = jnp.searchsorted(v_old, v_new)
-        idx = jnp.clip(idx, 1, len(v_old) - 2)
-
-        # Get local neighborhood for cubic interpolation (4 points when possible)
-        i = idx
-        v0, v1 = v_old[i - 1], v_old[i]
-        v_1 = jnp.where(i > 1, v_old[i - 2], v_old[i - 1] - (v_old[i] - v_old[i - 1]))
-        v2 = jnp.where(i < len(v_old) - 1, v_old[i + 1], v_old[i] + (v_old[i] - v_old[i - 1]))
-
-        y0, y1 = y_old[i - 1], y_old[i]
-        y_1 = jnp.where(i > 1, y_old[i - 2], y_old[i - 1])
-        y2 = jnp.where(i < len(v_old) - 1, y_old[i + 1], y_old[i])
-
-        # Normalize position in interval
-        t = (v_new - v0) / (v1 - v0 + 1e-10)
-
-        # Catmull-Rom spline coefficients
-        a = -0.5 * y_1 + 1.5 * y0 - 1.5 * y1 + 0.5 * y2
-        b = y_1 - 2.5 * y0 + 2.0 * y1 - 0.5 * y2
-        c = -0.5 * y_1 + 0.5 * y1
-        d = y0
-
-        return a * t**3 + b * t**2 + c * t + d
-
-    @partial(jit, static_argnums=(0,))
     def advect_v(self, f, E, dt):
-        """Advect in v-direction (acceleration) with cubic spline interpolation"""
+        """Advect in v-direction (acceleration) with cubic spline FFT interpolation"""
         # For each position, compute departure points in velocity
         v_dep = self.v[None, :] - E[:, None] * dt
 
-        # Clip to velocity boundaries
-        v_dep = jnp.clip(v_dep, -self.v_max, self.v_max)
+        # Clip to velocity boundaries and treat as periodic
+        # Map [-v_max, v_max] to periodic domain
+        v_dep_wrapped = ((v_dep + self.v_max) % (2 * self.v_max)) - self.v_max
 
         # Cubic spline interpolation over spatial dimension
         def interp_cubic_v(v_new, f_slice):
-            return self.cubic_spline_bounded(v_new, self.v, f_slice)
+            # Temporarily treat velocity as periodic for interpolation
+            v_periodic = self.v  # Already uniform grid
+            # Map v_new to [0, 2*v_max) for periodic treatment
+            v_new_shifted = v_new + self.v_max
+            v_grid_shifted = self.v + self.v_max
+
+            return self.cubic_spline_interp_periodic(v_new_shifted, v_grid_shifted, f_slice)
 
         # Use vmap to vectorize over spatial dimension
-        f_new = jax.vmap(lambda i: interp_cubic_v(v_dep[i, :], f[i, :]), out_axes=0)(jnp.arange(self.nx))
+        f_new = jax.vmap(lambda i: interp_cubic_v(v_dep_wrapped[i, :], f[i, :]), out_axes=0)(jnp.arange(self.nx))
 
         return f_new
 
@@ -216,7 +219,7 @@ solver = VlasovPoissonSolver(nx=128, nv=128)
 
 # Run simulation
 print("Running Vlasov-Poisson simulation...")
-times, snapshots, E_history = solver.simulate(T_final=50.0, dt=0.1, save_every=5)
+times, snapshots, E_history = solver.simulate(T_final=50.0, dt=0.1, save_every=1)
 
 # Plot electric field norm over time
 fig, ax = plt.subplots(figsize=(10, 6))
